@@ -74,6 +74,15 @@ docker-compose up
 - **Prompts**: `prompts/` - LLM prompts for entity extraction, deduplication, summarization
 - **Utilities**: `utils/` - Maintenance operations, bulk processing, datetime handling
 
+### Key Architectural Concepts
+
+- **Episodes**: Time-bounded data units that get processed into graph elements
+- **Temporal Modeling**: Bi-temporal tracking with valid_from/valid_to and created_at timestamps
+- **Hybrid Search**: Combines semantic (embeddings), lexical (BM25), and graph traversal
+- **Entity Extraction**: LLM-driven extraction of nodes and edges from episodes
+- **Deduplication**: Automated merging of similar entities using embedding similarity
+- **Search Recipes**: Pre-configured search strategies in `search_config_recipes.py`
+
 ### Server (`server/`)
 
 - **FastAPI Service**: `graph_service/main.py` - REST API server
@@ -97,6 +106,8 @@ docker-compose up
 
 - `OPENAI_API_KEY` - Required for LLM inference and embeddings
 - `USE_PARALLEL_RUNTIME` - Optional boolean for Neo4j parallel runtime (enterprise only)
+- `SEMAPHORE_LIMIT` - Controls concurrency (default: 10) to prevent 429 rate limit errors
+- `GRAPHITI_TELEMETRY_ENABLED` - Set to "false" to disable telemetry collection
 - Provider-specific keys: `ANTHROPIC_API_KEY`, `GOOGLE_API_KEY`, `GROQ_API_KEY`, `VOYAGE_API_KEY`
 
 ### Database Setup
@@ -121,12 +132,13 @@ docker-compose up
 ### Testing Requirements
 
 - Run tests with `make test` or `pytest`
-- Integration tests require database connections and are marked with `_int` suffix
+- Integration tests require database connections and are marked with `_int` suffix or `@pytest.mark.integration`
 - Use `pytest-xdist` for parallel test execution
 - Run specific test files: `pytest tests/test_specific_file.py`
 - Run specific test methods: `pytest tests/test_file.py::test_method_name`
-- Run only integration tests: `pytest tests/ -k "_int"`
-- Run only unit tests: `pytest tests/ -k "not _int"`
+- Run only integration tests: `pytest tests/ -k "_int"` or `pytest tests/ -m integration`
+- Run only unit tests: `pytest tests/ -k "not _int"` or `pytest tests/ -m "not integration"`
+- Evaluation tests are in `tests/evals/` and require separate setup
 
 ### LLM Provider Support
 

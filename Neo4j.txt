@@ -1,0 +1,72 @@
+POSTGRESQL INSTALLATION IN WSL UBUNTU:
+--------------------------------------
+1. Update package list:
+   sudo apt update
+
+2. Install PostgreSQL:
+   sudo apt install postgresql postgresql-contrib
+
+3. Start PostgreSQL service:
+   sudo systemctl start postgresql
+   sudo systemctl enable postgresql
+
+4. Set up PostgreSQL user:
+   sudo -u postgres psql
+   ALTER USER postgres PASSWORD 'password';
+   CREATE DATABASE etl_metadata;
+   \\q
+
+5. Configure PostgreSQL for network access:
+   sudo nano /etc/postgresql/*/main/postgresql.conf
+   # Uncomment and set: listen_addresses = '*'
+   
+   sudo nano /etc/postgresql/*/main/pg_hba.conf
+   # Add: host all all 0.0.0.0/0 md5
+
+6. Restart PostgreSQL:
+   sudo systemctl restart postgresql
+
+NEO4J INSTALLATION IN WSL UBUNTU:
+---------------------------------
+1. Add Neo4j repository:
+   wget -O - https://debian.neo4j.com/neotechnology.gpg.key | sudo apt-key add -
+   echo 'deb https://debian.neo4j.com stable latest' | sudo tee /etc/apt/sources.list.d/neo4j.list
+
+2. Install Neo4j:
+   sudo apt update
+   sudo apt install neo4j
+
+3. Configure Neo4j:
+   sudo nano /etc/neo4j/neo4j.conf
+   # Uncomment: dbms.default_listen_address=0.0.0.0
+   # Uncomment: dbms.connector.bolt.listen_address=:7687
+   # Uncomment: dbms.connector.http.listen_address=:7474
+
+4. Start Neo4j:
+   sudo systemctl start neo4j
+   sudo systemctl enable neo4j
+
+5. Set initial password:
+   # Visit http://localhost:7474 and set password to 'password'
+
+RECOMMENDED WSL INSTALLATION LOCATIONS:
+--------------------------------------
+PostgreSQL Data: /var/lib/postgresql/*/main/
+Neo4j Data: /var/lib/neo4j/
+Configuration: /etc/postgresql/ and /etc/neo4j/
+Logs: /var/log/postgresql/ and /var/log/neo4j/
+
+
+
+start Neo4j	sudo systemctl start neo4j
+stop Neo4j	sudo systemctl stop neo4j
+restart Neo4j	sudo systemctl restart neo4j
+status Neo4j	sudo systemctl status neo4j
+enable Neo4j	sudo systemctl enable neo4j
+disable Neo4j	sudo systemctl disable neo4j
+
+
+./bin/neo4j console
+chmod +x ./bin/neo4j
+
+uv run graphiti_mcp_server.py --model gpt-4.1-nano --transport sse

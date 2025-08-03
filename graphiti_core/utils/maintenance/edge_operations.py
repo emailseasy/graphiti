@@ -161,7 +161,14 @@ async def extract_edges(
             response_model=ExtractedEdges,
             max_tokens=extract_edges_max_tokens,
         )
-        edges_data = ExtractedEdges(**llm_response).edges
+        
+        # Handle both dictionary response (from Gemini) and Pydantic model response (from OpenAI)
+        if isinstance(llm_response, dict):
+            response_object = ExtractedEdges(**llm_response)
+        else:
+            response_object = llm_response if isinstance(llm_response, ExtractedEdges) else ExtractedEdges(**llm_response.model_dump())
+        
+        edges_data = response_object.edges
 
         context['extracted_facts'] = [edge_data.fact for edge_data in edges_data]
 
@@ -173,7 +180,11 @@ async def extract_edges(
                 max_tokens=extract_edges_max_tokens,
             )
 
-            missing_facts = reflexion_response.get('missing_facts', [])
+            # Handle both dictionary response (from Gemini) and Pydantic model response (from OpenAI)
+            if isinstance(reflexion_response, dict):
+                missing_facts = reflexion_response.get('missing_facts', [])
+            else:
+                missing_facts = getattr(reflexion_response, 'missing_facts', [])
 
             custom_prompt = 'The following facts were missed in a previous extraction: '
             for fact in missing_facts:
@@ -422,7 +433,13 @@ async def resolve_extracted_edge(
         response_model=EdgeDuplicate,
         model_size=ModelSize.small,
     )
-    response_object = EdgeDuplicate(**llm_response)
+    
+    # Handle both dictionary response (from Gemini) and Pydantic model response (from OpenAI)
+    if isinstance(llm_response, dict):
+        response_object = EdgeDuplicate(**llm_response)
+    else:
+        response_object = llm_response if isinstance(llm_response, EdgeDuplicate) else EdgeDuplicate(**llm_response.model_dump())
+    
     duplicate_facts = response_object.duplicate_facts
 
     duplicate_fact_ids: list[int] = [i for i in duplicate_facts if 0 <= i < len(related_edges)]

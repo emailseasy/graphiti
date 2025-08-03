@@ -1,0 +1,20 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(uv run graphiti_mcp_server.py --model gemini-2.5-pro --transport sse)",
+      "Bash(pkill:*)",
+      "Bash(uv run:*)",
+      "Bash(find .venv -name \"*gemini_reranker*\" -type f)",
+      "Bash(find .venv -path \"*graphiti_core/cross_encoder*\" -type f)",
+      "Bash(uv add:*)",
+      "Bash(timeout 10s uv run:*)",
+      "WebFetch(domain:ai.google.dev)",
+      "mcp__graphiti-memory__add_memory",
+      "mcp__graphiti-memory__get_episodes",
+      "mcp__graphiti-memory__clear_graph",
+      "mcp__graphiti-memory__search_memory_nodes",
+      "mcp__graphiti-memory__search_memory_facts"
+    ],
+    "deny": []
+  }
+}

@@ -170,7 +170,11 @@ async def eval_graph(multi_session_count: int, session_length: int, llm_client=N
                 response_model=EvalAddEpisodeResults,
             )
 
-            candidate_is_worse = llm_response.get('candidate_is_worse', False)
+            # Handle both dictionary response (from Gemini) and Pydantic model response (from OpenAI)
+            if isinstance(llm_response, dict):
+                candidate_is_worse = llm_response.get('candidate_is_worse', False)
+            else:
+                candidate_is_worse = getattr(llm_response, 'candidate_is_worse', False)
             user_raw_score += 0 if candidate_is_worse else 1
             print('llm_response:', llm_response)
         user_score = user_raw_score / len(add_episode_results[user_id])

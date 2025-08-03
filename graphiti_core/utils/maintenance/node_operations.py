@@ -59,7 +59,12 @@ async def extract_nodes_reflexion(
     llm_response = await llm_client.generate_response(
         prompt_library.extract_nodes.reflexion(context), MissedEntities
     )
-    missed_entities = llm_response.get('missed_entities', [])
+    
+    # Handle both dictionary response (from Gemini) and Pydantic model response (from OpenAI)
+    if isinstance(llm_response, dict):
+        missed_entities = llm_response['missed_entities']
+    else:
+        missed_entities = llm_response.missed_entities
 
     return missed_entities
 
@@ -123,7 +128,11 @@ async def extract_nodes(
                 prompt_library.extract_nodes.extract_json(context), response_model=ExtractedEntities
             )
 
-        response_object = ExtractedEntities(**llm_response)
+        # Handle both dictionary response (from Gemini) and Pydantic model response (from OpenAI)
+        if isinstance(llm_response, dict):
+            response_object = ExtractedEntities(**llm_response)
+        else:
+            response_object = llm_response if isinstance(llm_response, ExtractedEntities) else ExtractedEntities(**llm_response.model_dump())
 
         extracted_entities: list[ExtractedEntity] = response_object.extracted_entities
 
@@ -251,7 +260,12 @@ async def resolve_extracted_nodes(
         response_model=NodeResolutions,
     )
 
-    node_resolutions: list[NodeDuplicate] = NodeResolutions(**llm_response).entity_resolutions
+    # Handle both dictionary response (from Gemini) and Pydantic model response (from OpenAI)
+    if isinstance(llm_response, dict):
+        node_resolutions: list[NodeDuplicate] = NodeResolutions(**llm_response).entity_resolutions
+    else:
+        response_object = llm_response if isinstance(llm_response, NodeResolutions) else NodeResolutions(**llm_response.model_dump())
+        node_resolutions: list[NodeDuplicate] = response_object.entity_resolutions
 
     resolved_nodes: list[EntityNode] = []
     uuid_map: dict[str, str] = {}
@@ -367,11 +381,23 @@ async def extract_attributes_from_node(
         model_size=ModelSize.small,
     )
 
+    # Handle both dictionary response (from Gemini) and Pydantic model response (from OpenAI) for attributes
     if entity_type is not None:
-        entity_type(**llm_response)
+        if isinstance(llm_response, dict):
+            entity_type(**llm_response)
+            node_attributes = {key: value for key, value in llm_response.items()}
+        else:
+            # If llm_response is a Pydantic model, validate it and extract attributes
+            validated_model = llm_response if isinstance(llm_response, entity_type) else entity_type(**llm_response.model_dump())
+            node_attributes = validated_model.model_dump()
+    else:
+        node_attributes = {}
 
-    node.summary = summary_response.get('summary', '')
-    node_attributes = {key: value for key, value in llm_response.items()}
+    # Handle both dictionary response (from Gemini) and Pydantic model response (from OpenAI) for summary
+    if isinstance(summary_response, dict):
+        node.summary = summary_response['summary']
+    else:
+        node.summary = summary_response.summary
 
     node.attributes.update(node_attributes)
 

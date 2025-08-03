@@ -46,8 +46,13 @@ async def extract_edge_dates(
         prompt_library.extract_edge_dates.v1(context), response_model=EdgeDates
     )
 
-    valid_at = llm_response.get('valid_at')
-    invalid_at = llm_response.get('invalid_at')
+    # Handle both dictionary response (from Gemini) and Pydantic model response (from OpenAI)
+    if isinstance(llm_response, dict):
+        valid_at = llm_response['valid_at']
+        invalid_at = llm_response['invalid_at']
+    else:
+        valid_at = llm_response.valid_at
+        invalid_at = llm_response.invalid_at
 
     valid_at_datetime = None
     invalid_at_datetime = None
@@ -87,7 +92,11 @@ async def get_edge_contradictions(
         model_size=ModelSize.small,
     )
 
-    contradicted_facts: list[int] = llm_response.get('contradicted_facts', [])
+    # Handle both dictionary response (from Gemini) and Pydantic model response (from OpenAI)
+    if isinstance(llm_response, dict):
+        contradicted_facts: list[int] = llm_response['contradicted_facts']
+    else:
+        contradicted_facts: list[int] = llm_response.contradicted_facts
 
     contradicted_edges: list[EntityEdge] = [existing_edges[i] for i in contradicted_facts]
 

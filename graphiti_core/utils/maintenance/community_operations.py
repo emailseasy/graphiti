@@ -130,7 +130,11 @@ async def summarize_pair(llm_client: LLMClient, summary_pair: tuple[str, str]) -
         prompt_library.summarize_nodes.summarize_pair(context), response_model=Summary
     )
 
-    pair_summary = llm_response.get('summary', '')
+    # Handle both dictionary response (from Gemini) and Pydantic model response (from OpenAI)
+    if isinstance(llm_response, dict):
+        pair_summary = llm_response['summary']
+    else:
+        pair_summary = llm_response.summary
 
     return pair_summary
 
@@ -143,7 +147,11 @@ async def generate_summary_description(llm_client: LLMClient, summary: str) -> s
         response_model=SummaryDescription,
     )
 
-    description = llm_response.get('description', '')
+    # Handle both dictionary response (from Gemini) and Pydantic model response (from OpenAI)
+    if isinstance(llm_response, dict):
+        description = llm_response['description']
+    else:
+        description = llm_response.description
 
     return description
 
