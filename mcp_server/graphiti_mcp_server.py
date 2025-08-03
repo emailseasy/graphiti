@@ -1,6 +1,19 @@
 #!/usr/bin/env python3
 """
 Graphiti MCP Server - Exposes Graphiti functionality through the Model Context Protocol (MCP)
+
+Supports multiple LLM providers:
+- OpenAI: Set OPENAI_API_KEY, use models like gpt-4.1-mini, gpt-4o
+- Google Gemini: Set GOOGLE_API_KEY, use models like gemini-2.5-flash, gemini-2.5-pro
+- Azure OpenAI: Set AZURE_OPENAI_ENDPOINT and related Azure configuration
+
+For Gemini models:
+- Set GOOGLE_API_KEY environment variable (get from https://aistudio.google.com/app/apikey)
+- Optionally set GEMINI_THINKING_ENABLED=true for Gemini 2.5+ models
+- Use model names like: gemini-2.5-flash, gemini-2.5-pro, gemini-1.5-flash
+
+Example usage:
+  uv run graphiti_mcp_server.py --model gemini-2.5-flash --transport sse
 """
 
 import argparse
@@ -26,7 +39,16 @@ from graphiti_core.embedder.openai import OpenAIEmbedder, OpenAIEmbedderConfig
 from graphiti_core.llm_client import LLMClient
 from graphiti_core.llm_client.azure_openai_client import AzureOpenAILLMClient
 from graphiti_core.llm_client.config import LLMConfig
+from graphiti_core.llm_client.errors import RateLimitError, RefusalError, EmptyResponseError
 from graphiti_core.llm_client.openai_client import OpenAIClient
+
+# Import GeminiClient with proper error handling
+try:
+    from graphiti_core.llm_client.gemini_client import GeminiClient
+    GEMINI_AVAILABLE = True
+except ImportError:
+    GEMINI_AVAILABLE = False
+    GeminiClient = None
 from graphiti_core.nodes import EpisodeType, EpisodicNode
 from graphiti_core.search.search_config_recipes import (
     NODE_HYBRID_SEARCH_NODE_DISTANCE,
@@ -200,71 +222,112 @@ class GraphitiLLMConfig(BaseModel):
     azure_openai_deployment_name: str | None = None
     azure_openai_api_version: str | None = None
     azure_openai_use_managed_identity: bool = False
+    # Gemini-specific configuration
+    google_api_key: str | None = None
+    gemini_thinking_enabled: bool = False
 
     @classmethod
     def from_env(cls) -> 'GraphitiLLMConfig':
         """Create LLM configuration from environment variables."""
         # Get model from environment, or use default if not set or empty
         model_env = os.environ.get('MODEL_NAME', '')
-        model = model_env if model_env.strip() else DEFAULT_LLM_MODEL
+        
+        # Get API keys to determine default model
+        google_api_key = os.environ.get('GOOGLE_API_KEY', None)
+        openai_api_key = os.environ.get('OPENAI_API_KEY', None)
+        azure_endpoint = os.environ.get('AZURE_OPENAI_ENDPOINT', None)
+        
+        # Determine default model based on available API keys if no model specified
+        if model_env.strip():
+            model = model_env.strip()
+        else:
+            # Default model selection based on available API keys and priority
+            # Requirements 1.4, 1.5, 2.4, 2.5: Proper default model handling
+            if azure_endpoint:
+                # Azure OpenAI takes highest priority when configured
+                model = DEFAULT_LLM_MODEL
+                logger.debug(f'No model specified, using default for Azure OpenAI: {model}')
+            elif google_api_key:
+                # Google API key present, default to Gemini (gemini-2.5-flash)
+                # This satisfies requirement 1.4: default to "gemini-2.5-flash" when GOOGLE_API_KEY is present
+                model = 'gemini-2.5-flash'
+                if openai_api_key:
+                    logger.info(f'Both GOOGLE_API_KEY and OPENAI_API_KEY detected, defaulting to Gemini: {model}')
+                else:
+                    logger.info(f'GOOGLE_API_KEY detected, defaulting to Gemini: {model}')
+            elif openai_api_key:
+                # Only OpenAI API key available, use OpenAI default (backward compatibility)
+                # This satisfies requirement 1.5: existing OpenAI default behavior remains unchanged
+                model = DEFAULT_LLM_MODEL
+                logger.debug(f'OPENAI_API_KEY detected, using OpenAI default: {model}')
+            else:
+                # No API keys available, use OpenAI default for backward compatibility
+                # This ensures existing behavior remains unchanged when no API keys are present
+                model = DEFAULT_LLM_MODEL
+                if not model_env:
+                    logger.debug(f'No MODEL_NAME or API keys set, using default: {model}')
+                else:
+                    logger.warning(f'Empty MODEL_NAME environment variable, using default: {model}')
 
         # Get small_model from environment, or use default if not set or empty
         small_model_env = os.environ.get('SMALL_MODEL_NAME', '')
         small_model = small_model_env if small_model_env.strip() else SMALL_LLM_MODEL
 
-        azure_openai_endpoint = os.environ.get('AZURE_OPENAI_ENDPOINT', None)
         azure_openai_api_version = os.environ.get('AZURE_OPENAI_API_VERSION', None)
         azure_openai_deployment_name = os.environ.get('AZURE_OPENAI_DEPLOYMENT_NAME', None)
         azure_openai_use_managed_identity = (
             os.environ.get('AZURE_OPENAI_USE_MANAGED_IDENTITY', 'false').lower() == 'true'
         )
 
-        if azure_openai_endpoint is None:
-            # Setup for OpenAI API
-            # Log if empty model was provided
-            if model_env == '':
-                logger.debug(
-                    f'MODEL_NAME environment variable not set, using default: {DEFAULT_LLM_MODEL}'
-                )
-            elif not model_env.strip():
-                logger.warning(
-                    f'Empty MODEL_NAME environment variable, using default: {DEFAULT_LLM_MODEL}'
-                )
+        # Get Gemini-specific configuration
+        gemini_thinking_enabled = (
+            os.environ.get('GEMINI_THINKING_ENABLED', 'false').lower() == 'true'
+        )
 
+        if azure_endpoint is None:
+            # Setup for OpenAI or Gemini API
             return cls(
-                api_key=os.environ.get('OPENAI_API_KEY'),
+                api_key=openai_api_key,
                 model=model,
                 small_model=small_model,
                 temperature=float(os.environ.get('LLM_TEMPERATURE', '0.0')),
+                google_api_key=google_api_key,
+                gemini_thinking_enabled=gemini_thinking_enabled,
             )
         else:
             # Setup for Azure OpenAI API
             # Log if empty deployment name was provided
             if azure_openai_deployment_name is None:
                 logger.error('AZURE_OPENAI_DEPLOYMENT_NAME environment variable not set')
-
                 raise ValueError('AZURE_OPENAI_DEPLOYMENT_NAME environment variable not set')
+            
             if not azure_openai_use_managed_identity:
                 # api key
-                api_key = os.environ.get('OPENAI_API_KEY', None)
+                api_key = openai_api_key
             else:
                 # Managed identity
                 api_key = None
 
             return cls(
                 azure_openai_use_managed_identity=azure_openai_use_managed_identity,
-                azure_openai_endpoint=azure_openai_endpoint,
+                azure_openai_endpoint=azure_endpoint,
                 api_key=api_key,
                 azure_openai_api_version=azure_openai_api_version,
                 azure_openai_deployment_name=azure_openai_deployment_name,
                 model=model,
                 small_model=small_model,
                 temperature=float(os.environ.get('LLM_TEMPERATURE', '0.0')),
+                google_api_key=google_api_key,
+                gemini_thinking_enabled=gemini_thinking_enabled,
             )
 
     @classmethod
     def from_cli_and_env(cls, args: argparse.Namespace) -> 'GraphitiLLMConfig':
-        """Create LLM configuration from CLI arguments, falling back to environment variables."""
+        """Create LLM configuration from CLI arguments, falling back to environment variables.
+        
+        CLI arguments properly override environment variables for Gemini configuration.
+        Validates model names to ensure they are properly handled for all providers.
+        """
         # Start with environment-based config
         config = cls.from_env()
 
@@ -272,78 +335,450 @@ class GraphitiLLMConfig(BaseModel):
         if hasattr(args, 'model') and args.model:
             # Only use CLI model if it's not empty
             if args.model.strip():
-                config.model = args.model
+                # Validate model name format and provide helpful feedback
+                model_name = args.model.strip()
+                config.model = model_name
+                
+                # Log model selection with provider detection
+                try:
+                    # Temporarily set model to detect provider
+                    temp_config = cls(
+                        model=model_name,
+                        api_key=config.api_key,
+                        google_api_key=config.google_api_key,
+                        azure_openai_endpoint=config.azure_openai_endpoint
+                    )
+                    provider = temp_config._detect_provider()
+                    logger.info(f'CLI model "{model_name}" detected as {provider} provider')
+                    
+                    # Validate provider-specific model naming conventions
+                    if provider == 'gemini' and not model_name.startswith('gemini-'):
+                        logger.warning(
+                            f'Model "{model_name}" detected as Gemini provider but does not follow '
+                            'Gemini naming convention (gemini-X.X-model). This may cause issues.'
+                        )
+                    elif provider == 'openai' and not model_name.startswith('gpt-'):
+                        logger.warning(
+                            f'Model "{model_name}" detected as OpenAI provider but does not follow '
+                            'OpenAI naming convention (gpt-X). This may cause issues.'
+                        )
+                        
+                except Exception as e:
+                    logger.warning(f'Could not validate model "{model_name}": {e}')
+                    
             else:
                 # Log that empty model was provided and default is used
                 logger.warning(f'Empty model name provided, using default: {DEFAULT_LLM_MODEL}')
 
         if hasattr(args, 'small_model') and args.small_model:
             if args.small_model.strip():
-                config.small_model = args.small_model
+                small_model_name = args.small_model.strip()
+                config.small_model = small_model_name
+                logger.info(f'CLI small_model set to: {small_model_name}')
             else:
                 logger.warning(f'Empty small_model name provided, using default: {SMALL_LLM_MODEL}')
 
         if hasattr(args, 'temperature') and args.temperature is not None:
-            config.temperature = args.temperature
+            # Validate temperature range
+            if 0.0 <= args.temperature <= 2.0:
+                config.temperature = args.temperature
+                logger.info(f'CLI temperature set to: {args.temperature}')
+            else:
+                logger.warning(
+                    f'Temperature {args.temperature} is outside valid range (0.0-2.0). '
+                    f'Using default: {config.temperature}'
+                )
+
+        # Validate final configuration for consistency
+        config._validate_configuration_consistency()
 
         return config
+
+    def _detect_provider(self) -> str:
+        """Detect which LLM provider to use based on model name patterns and available API keys.
+        
+        Provider detection follows this priority order:
+        1. Azure OpenAI (when azure_openai_endpoint is configured)
+        2. Model name patterns (gemini-* → gemini, gpt-* → openai)
+        3. API key-based fallback (google_api_key → gemini, api_key → openai)
+        
+        This method works with the updated DEFAULT_LLM_MODEL handling to ensure proper
+        provider detection for both explicit model names and default model scenarios.
+        
+        Returns:
+            Provider name: 'azure_openai', 'gemini', or 'openai'
+        """
+        # Azure OpenAI has highest priority when configured
+        if self.azure_openai_endpoint is not None:
+            return 'azure_openai'
+        
+        # Model name-based detection takes precedence over API key fallback
+        if self.model and self.model.startswith('gemini-'):
+            return 'gemini'
+        elif self.model and self.model.startswith('gpt-'):
+            # Handle the case where default OpenAI model is used but only Google API key is available
+            # This can happen if someone manually sets MODEL_NAME to a gpt- model but only has GOOGLE_API_KEY
+            if self.model == DEFAULT_LLM_MODEL and self.google_api_key and not self.api_key:
+                logger.warning(
+                    f'Default OpenAI model "{DEFAULT_LLM_MODEL}" specified but only GOOGLE_API_KEY is available. '
+                    'Consider setting MODEL_NAME to a Gemini model (e.g., gemini-2.5-flash) or providing OPENAI_API_KEY.'
+                )
+                return 'gemini'
+            return 'openai'
+        
+        # API key-based fallback for models without specific patterns
+        # This handles cases where model names don't follow standard patterns
+        # Requirements 2.4, 2.5: Fallback scenarios with various API key combinations
+        if self.google_api_key:
+            return 'gemini'
+        elif self.api_key:
+            return 'openai'
+        
+        raise ValueError(
+            'No valid LLM provider configuration found. '
+            'Please set OPENAI_API_KEY, GOOGLE_API_KEY, or configure Azure OpenAI.'
+        )
+
+    def _validate_configuration_consistency(self) -> None:
+        """Validate configuration consistency across all providers.
+        
+        Ensures that model names are properly handled for all providers and that
+        required API keys are available for the detected provider.
+        """
+        try:
+            provider = self._detect_provider()
+            
+            # Validate provider-specific requirements
+            if provider == 'gemini':
+                if not self.google_api_key:
+                    logger.warning(
+                        f'Model "{self.model}" requires GOOGLE_API_KEY but it is not set. '
+                        'The server may fail to start. Get your API key from: https://aistudio.google.com/app/apikey'
+                    )
+                elif not GEMINI_AVAILABLE:
+                    logger.warning(
+                        f'Model "{self.model}" requires google-genai dependency but it is not available. '
+                        'Install with: pip install graphiti-core[google-genai]'
+                    )
+                    
+            elif provider == 'openai':
+                if not self.api_key:
+                    logger.warning(
+                        f'Model "{self.model}" requires OPENAI_API_KEY but it is not set. '
+                        'The server may fail to start.'
+                    )
+                    
+            elif provider == 'azure_openai':
+                if not self.azure_openai_use_managed_identity and not self.api_key:
+                    logger.warning(
+                        'Azure OpenAI configuration detected but OPENAI_API_KEY is not set '
+                        'and managed identity is not enabled. The server may fail to start.'
+                    )
+                    
+            # Log successful configuration validation
+            logger.info(f'Configuration validated for {provider} provider with model: {self.model}')
+            
+        except ValueError as e:
+            # Log configuration issues but don't fail - let the actual client creation handle errors
+            logger.warning(f'Configuration validation warning: {e}')
+
+    def _validate_gemini_config(self) -> None:
+        """Validate Gemini-specific configuration.
+        
+        Performs comprehensive validation of Gemini configuration including:
+        - Dependency availability check
+        - API key validation
+        - Model compatibility checks
+        - Thinking configuration validation
+        
+        Raises:
+            ImportError: When google-genai dependency is missing
+            ValueError: When required configuration is missing or invalid
+        """
+        # Check if google-genai dependency is available
+        if not GEMINI_AVAILABLE:
+            raise ImportError(
+                'google-genai is required for Gemini models. '
+                'Install the required dependency with: pip install graphiti-core[google-genai] '
+                'or pip install google-genai'
+            )
+        
+        # Validate API key presence and format
+        if not self.google_api_key:
+            raise ValueError(
+                'GOOGLE_API_KEY environment variable must be set when using Gemini models. '
+                'Get your API key from: https://aistudio.google.com/app/apikey'
+            )
+        
+        # Basic API key format validation (Google API keys typically start with 'AI')
+        if not self.google_api_key.strip():
+            raise ValueError(
+                'GOOGLE_API_KEY cannot be empty. '
+                'Please provide a valid Google API key from: https://aistudio.google.com/app/apikey'
+            )
+        
+        # Validate model name format for Gemini
+        if self.model and not self.model.startswith('gemini-'):
+            logger.warning(
+                f'Model name "{self.model}" does not follow Gemini naming convention. '
+                'Expected format: gemini-X.X-model (e.g., gemini-2.5-flash)'
+            )
+        
+        # Validate thinking configuration compatibility
+        if self.gemini_thinking_enabled and self.model:
+            if not self.model.startswith('gemini-2.5'):
+                logger.warning(
+                    f'Thinking configuration is enabled but model "{self.model}" may not support it. '
+                    'Thinking is only supported on Gemini 2.5+ models. '
+                    'The configuration will be ignored for unsupported models.'
+                )
+        
+        # Log successful validation
+        logger.info(f'Gemini configuration validated successfully for model: {self.model}')
+
+    def _create_gemini_client(self) -> LLMClient:
+        """Create and configure Gemini client with proper configuration mapping and error handling.
+        
+        Returns:
+            GeminiClient instance configured with the current settings
+            
+        Raises:
+            ImportError: When google-genai dependency is missing or incompatible
+            ValueError: When configuration is invalid
+            Exception: When client creation fails for other reasons
+        """
+        try:
+            # Validate configuration first
+            self._validate_gemini_config()
+            
+            # Create LLMConfig with mapped parameters
+            llm_config = LLMConfig(
+                api_key=self.google_api_key,
+                model=self.model,
+                small_model=self.small_model,
+                temperature=self.temperature,
+            )
+            
+            # Handle thinking configuration for Gemini 2.5+ models
+            thinking_config = None
+            if self.gemini_thinking_enabled and self.model:
+                # Check if model supports thinking (Gemini 2.5+ models)
+                if self.model.startswith('gemini-2.5'):
+                    try:
+                        # Import thinking config from google.genai
+                        from google.genai import types
+                        thinking_config = types.ThinkingConfig()
+                        logger.info(f'Thinking configuration enabled for model: {self.model}')
+                    except ImportError as import_err:
+                        logger.warning(
+                            'google-genai package does not support thinking configuration. '
+                            'Please update to a newer version: pip install --upgrade google-genai'
+                        )
+                        # Continue without thinking config rather than failing
+                    except AttributeError as attr_err:
+                        logger.warning(
+                            f'ThinkingConfig not available in current google-genai version: {attr_err}. '
+                            'Please update to a newer version: pip install --upgrade google-genai'
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            f'Failed to create thinking configuration: {e}. '
+                            'Continuing without thinking configuration.'
+                        )
+                else:
+                    logger.warning(
+                        f'Thinking configuration requested but model {self.model} does not support it. '
+                        'Only Gemini 2.5+ models support thinking. Continuing without thinking configuration.'
+                    )
+            
+            # Create and return GeminiClient with comprehensive error handling
+            try:
+                client = GeminiClient(
+                    config=llm_config,
+                    thinking_config=thinking_config,
+                )
+                logger.info(f'Successfully created Gemini client for model: {self.model}')
+                return client
+                
+            except Exception as client_err:
+                # Handle specific Gemini client creation errors
+                error_msg = str(client_err).lower()
+                
+                if 'api key' in error_msg or 'authentication' in error_msg:
+                    raise ValueError(
+                        f'Invalid Google API key. Please check your GOOGLE_API_KEY environment variable. '
+                        f'Get a valid API key from: https://aistudio.google.com/app/apikey. '
+                        f'Original error: {client_err}'
+                    ) from client_err
+                elif 'model' in error_msg and 'not found' in error_msg:
+                    raise ValueError(
+                        f'Gemini model "{self.model}" not found or not accessible. '
+                        f'Please check the model name and your API key permissions. '
+                        f'Available models include: gemini-2.5-flash, gemini-2.5-pro, gemini-1.5-flash. '
+                        f'Original error: {client_err}'
+                    ) from client_err
+                elif 'quota' in error_msg or 'rate limit' in error_msg:
+                    raise ValueError(
+                        f'Google API quota exceeded or rate limit hit. '
+                        f'Please check your API usage and billing settings. '
+                        f'Original error: {client_err}'
+                    ) from client_err
+                else:
+                    # Re-raise with additional context
+                    raise ValueError(
+                        f'Failed to create Gemini client: {client_err}. '
+                        f'Please check your GOOGLE_API_KEY and model configuration.'
+                    ) from client_err
+                    
+        except (ImportError, ValueError):
+            # Re-raise validation and import errors as-is
+            raise
+        except Exception as e:
+            # Handle any other unexpected errors
+            raise ValueError(
+                f'Unexpected error while creating Gemini client: {e}. '
+                f'Please check your configuration and try again.'
+            ) from e
 
     def create_client(self) -> LLMClient:
         """Create an LLM client based on this configuration.
 
+        Uses provider detection logic to determine which client to create based on
+        model name patterns and available API keys. Supports Azure OpenAI, Gemini,
+        and OpenAI providers with proper error handling.
+
         Returns:
             LLMClient instance
+
+        Raises:
+            ValueError: When no valid provider configuration is found or required API keys are missing
+            ImportError: When required dependencies are missing (e.g., google-genai for Gemini)
         """
+        try:
+            # Detect provider based on configuration
+            provider = self._detect_provider()
+            
+            if provider == 'azure_openai':
+                # Azure OpenAI API setup - highest priority when configured
+                if self.azure_openai_use_managed_identity:
+                    # Use managed identity for authentication
+                    token_provider = create_azure_credential_token_provider()
+                    return AzureOpenAILLMClient(
+                        azure_client=AsyncAzureOpenAI(
+                            azure_endpoint=self.azure_openai_endpoint,
+                            azure_deployment=self.azure_openai_deployment_name,
+                            api_version=self.azure_openai_api_version,
+                            azure_ad_token_provider=token_provider,
+                        ),
+                        config=LLMConfig(
+                            api_key=self.api_key,
+                            model=self.model,
+                            small_model=self.small_model,
+                            temperature=self.temperature,
+                        ),
+                    )
+                elif self.api_key:
+                    # Use API key for authentication
+                    return AzureOpenAILLMClient(
+                        azure_client=AsyncAzureOpenAI(
+                            azure_endpoint=self.azure_openai_endpoint,
+                            azure_deployment=self.azure_openai_deployment_name,
+                            api_version=self.azure_openai_api_version,
+                            api_key=self.api_key,
+                        ),
+                        config=LLMConfig(
+                            api_key=self.api_key,
+                            model=self.model,
+                            small_model=self.small_model,
+                            temperature=self.temperature,
+                        ),
+                    )
+                else:
+                    raise ValueError('OPENAI_API_KEY must be set when using Azure OpenAI API')
+            
+            elif provider == 'gemini':
+                # Create Gemini client with proper error handling
+                return self._create_gemini_client()
+            
+            elif provider == 'openai':
+                # Standard OpenAI API setup
+                if not self.api_key:
+                    raise ValueError('OPENAI_API_KEY must be set when using OpenAI API')
 
-        if self.azure_openai_endpoint is not None:
-            # Azure OpenAI API setup
-            if self.azure_openai_use_managed_identity:
-                # Use managed identity for authentication
-                token_provider = create_azure_credential_token_provider()
-                return AzureOpenAILLMClient(
-                    azure_client=AsyncAzureOpenAI(
-                        azure_endpoint=self.azure_openai_endpoint,
-                        azure_deployment=self.azure_openai_deployment_name,
-                        api_version=self.azure_openai_api_version,
-                        azure_ad_token_provider=token_provider,
-                    ),
-                    config=LLMConfig(
-                        api_key=self.api_key,
-                        model=self.model,
-                        small_model=self.small_model,
-                        temperature=self.temperature,
-                    ),
+                llm_client_config = LLMConfig(
+                    api_key=self.api_key, 
+                    model=self.model, 
+                    small_model=self.small_model,
+                    temperature=self.temperature
                 )
-            elif self.api_key:
-                # Use API key for authentication
-                return AzureOpenAILLMClient(
-                    azure_client=AsyncAzureOpenAI(
-                        azure_endpoint=self.azure_openai_endpoint,
-                        azure_deployment=self.azure_openai_deployment_name,
-                        api_version=self.azure_openai_api_version,
-                        api_key=self.api_key,
-                    ),
-                    config=LLMConfig(
-                        api_key=self.api_key,
-                        model=self.model,
-                        small_model=self.small_model,
-                        temperature=self.temperature,
-                    ),
-                )
+
+                return OpenAIClient(config=llm_client_config)
+            
             else:
-                raise ValueError('OPENAI_API_KEY must be set when using Azure OpenAI API')
-
-        if not self.api_key:
-            raise ValueError('OPENAI_API_KEY must be set when using OpenAI API')
-
-        llm_client_config = LLMConfig(
-            api_key=self.api_key, model=self.model, small_model=self.small_model
-        )
-
-        # Set temperature
-        llm_client_config.temperature = self.temperature
-
-        return OpenAIClient(config=llm_client_config)
+                raise ValueError(f'Unknown provider: {provider}')
+                
+        except ImportError as e:
+            # Handle missing dependencies with clear error messages
+            error_msg = str(e).lower()
+            if 'google-genai' in error_msg or 'gemini' in error_msg:
+                raise ImportError(
+                    f'Failed to create Gemini client due to missing dependency: {e}. '
+                    'Install the required dependency with one of the following commands:\n'
+                    '  pip install graphiti-core[google-genai]\n'
+                    '  pip install google-genai\n'
+                    'Then restart the MCP server.'
+                ) from e
+            else:
+                # Re-raise other import errors with context
+                provider = 'unknown'
+                try:
+                    provider = self._detect_provider()
+                except Exception:
+                    pass
+                raise ImportError(
+                    f'Failed to import required dependencies for {provider} provider: {e}'
+                ) from e
+        except ValueError as e:
+            # Re-raise ValueError with provider context if not already included
+            error_msg = str(e)
+            if 'provider' not in error_msg.lower():
+                try:
+                    provider = self._detect_provider()
+                    raise ValueError(f'Configuration error for {provider} provider: {e}') from e
+                except Exception:
+                    pass
+            raise
+        except Exception as e:
+            # Provide context for other configuration errors
+            provider = 'unknown'
+            try:
+                provider = self._detect_provider()
+            except Exception:
+                pass
+            
+            # Check for common error patterns and provide helpful messages
+            error_msg = str(e).lower()
+            if 'safety' in error_msg or 'blocked' in error_msg:
+                raise ValueError(
+                    f'Content safety error from {provider} provider: {e}. '
+                    'This may be due to content being blocked by safety filters. '
+                    'Try rephrasing your request or check the provider\'s content policy.'
+                ) from e
+            elif 'rate limit' in error_msg or 'quota' in error_msg or '429' in error_msg:
+                raise ValueError(
+                    f'Rate limit or quota exceeded for {provider} provider: {e}. '
+                    'Please check your API usage limits and billing settings.'
+                ) from e
+            elif 'network' in error_msg or 'connection' in error_msg or 'timeout' in error_msg:
+                raise ValueError(
+                    f'Network connectivity error with {provider} provider: {e}. '
+                    'Please check your internet connection and try again.'
+                ) from e
+            else:
+                raise ValueError(
+                    f'Failed to create LLM client for {provider} provider: {e}. '
+                    'Please check your configuration and API credentials.'
+                ) from e
 
 
 class GraphitiEmbedderConfig(BaseModel):
@@ -528,6 +963,82 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
+def handle_gemini_runtime_error(error: Exception, operation: str = 'LLM operation') -> str:
+    """Handle Gemini-specific runtime errors and return user-friendly error messages.
+    
+    Args:
+        error: The exception that occurred
+        operation: Description of the operation that failed
+        
+    Returns:
+        User-friendly error message with guidance
+    """
+    error_msg = str(error).lower()
+    
+    # Handle Gemini safety filter errors
+    if 'safety' in error_msg or 'blocked' in error_msg:
+        return (
+            f'{operation} failed due to Gemini safety filters. '
+            'The content was blocked for safety reasons. '
+            'Try rephrasing your request to avoid potentially harmful content, '
+            'or check Google\'s AI safety policies for more information.'
+        )
+    
+    # Handle rate limiting errors
+    if any(term in error_msg for term in ['rate limit', 'quota', 'resource_exhausted', '429']):
+        return (
+            f'{operation} failed due to rate limiting or quota exceeded. '
+            'Please wait a moment and try again, or check your Google API usage limits '
+            'and billing settings at https://console.cloud.google.com/apis/api/generativelanguage.googleapis.com'
+        )
+    
+    # Handle authentication errors
+    if any(term in error_msg for term in ['api key', 'authentication', 'unauthorized', '401', '403']):
+        return (
+            f'{operation} failed due to authentication error. '
+            'Please check your GOOGLE_API_KEY environment variable and ensure it\'s valid. '
+            'Get a new API key from: https://aistudio.google.com/app/apikey'
+        )
+    
+    # Handle model not found errors
+    if 'model' in error_msg and any(term in error_msg for term in ['not found', 'invalid', 'unsupported']):
+        return (
+            f'{operation} failed because the Gemini model is not found or unsupported. '
+            'Please check your model name and ensure it\'s a valid Gemini model '
+            '(e.g., gemini-2.5-flash, gemini-2.5-pro, gemini-1.5-flash).'
+        )
+    
+    # Handle network connectivity errors
+    if any(term in error_msg for term in ['network', 'connection', 'timeout', 'unreachable']):
+        return (
+            f'{operation} failed due to network connectivity issues. '
+            'Please check your internet connection and try again. '
+            'If the problem persists, Google\'s Gemini API may be temporarily unavailable.'
+        )
+    
+    # Handle token limit errors
+    if any(term in error_msg for term in ['token', 'length', 'too long', 'context']):
+        return (
+            f'{operation} failed because the input is too long for the Gemini model. '
+            'Try reducing the size of your input or breaking it into smaller chunks.'
+        )
+    
+    # Handle thinking configuration errors
+    if 'thinking' in error_msg:
+        return (
+            f'{operation} failed due to thinking configuration error. '
+            'Thinking is only supported on Gemini 2.5+ models. '
+            'Either use a supported model or disable thinking by setting GEMINI_THINKING_ENABLED=false.'
+        )
+    
+    # Generic error handling for other Gemini errors
+    return (
+        f'{operation} failed with Gemini error: {error}. '
+        'Please check your configuration and try again. '
+        'If the problem persists, consult the Gemini API documentation.'
+    )
+
 # Create global config instance - will be properly initialized later
 config = GraphitiConfig()
 
@@ -610,8 +1121,22 @@ async def initialize_graphiti():
 
         # Log configuration details for transparency
         if llm_client:
-            logger.info(f'Using OpenAI model: {config.llm.model}')
-            logger.info(f'Using temperature: {config.llm.temperature}')
+            try:
+                provider = config.llm._detect_provider()
+                logger.info(f'Using {provider} provider with model: {config.llm.model}')
+                logger.info(f'Using temperature: {config.llm.temperature}')
+                
+                # Log Gemini-specific configuration
+                if provider == 'gemini':
+                    logger.info(f'Gemini thinking enabled: {config.llm.gemini_thinking_enabled}')
+                    if config.llm.gemini_thinking_enabled and config.llm.model:
+                        if config.llm.model.startswith('gemini-2.5'):
+                            logger.info('Thinking configuration will be applied to supported model')
+                        else:
+                            logger.warning('Thinking configuration requested but model may not support it')
+            except Exception:
+                logger.info(f'Using LLM model: {config.llm.model}')
+                logger.info(f'Using temperature: {config.llm.temperature}')
         else:
             logger.info('No LLM client configured - entity extraction will be limited')
 
@@ -622,7 +1147,36 @@ async def initialize_graphiti():
         logger.info(f'Using concurrency limit: {SEMAPHORE_LIMIT}')
 
     except Exception as e:
-        logger.error(f'Failed to initialize Graphiti: {str(e)}')
+        # Enhanced error handling with specific guidance for different error types
+        error_msg = str(e).lower()
+        
+        if 'google-genai' in error_msg or 'gemini' in error_msg:
+            logger.error(
+                f'Failed to initialize Graphiti due to Gemini configuration error: {e}\n'
+                'Please ensure:\n'
+                '  1. google-genai is installed: pip install graphiti-core[google-genai]\n'
+                '  2. GOOGLE_API_KEY is set with a valid API key from https://aistudio.google.com/app/apikey\n'
+                '  3. Your model name follows Gemini naming convention (e.g., gemini-2.5-flash)'
+            )
+        elif 'api key' in error_msg or 'authentication' in error_msg:
+            logger.error(
+                f'Failed to initialize Graphiti due to API key error: {e}\n'
+                'Please check your API key configuration:\n'
+                '  - For OpenAI: Set OPENAI_API_KEY\n'
+                '  - For Gemini: Set GOOGLE_API_KEY\n'
+                '  - For Azure OpenAI: Set OPENAI_API_KEY and Azure configuration'
+            )
+        elif 'neo4j' in error_msg or 'database' in error_msg:
+            logger.error(
+                f'Failed to initialize Graphiti due to database error: {e}\n'
+                'Please ensure:\n'
+                '  1. Neo4j is running and accessible\n'
+                '  2. NEO4J_URI, NEO4J_USER, and NEO4J_PASSWORD are correctly set\n'
+                '  3. Database credentials are valid'
+            )
+        else:
+            logger.error(f'Failed to initialize Graphiti: {e}')
+        
         raise
 
 
@@ -800,7 +1354,27 @@ async def add_memory(
 
                 logger.info(f"Episode '{name}' processed successfully")
             except Exception as e:
-                error_msg = str(e)
+                # Enhanced error handling with Gemini-specific error messages
+                if isinstance(e, (RateLimitError, RefusalError, EmptyResponseError)):
+                    # Handle known LLM client errors
+                    if isinstance(e, RateLimitError):
+                        error_msg = handle_gemini_runtime_error(e, f"Episode processing for '{name}'")
+                    elif isinstance(e, RefusalError):
+                        error_msg = f"Episode processing for '{name}' was refused by the LLM: {e}"
+                    else:  # EmptyResponseError
+                        error_msg = f"Episode processing for '{name}' received empty response from LLM: {e}"
+                else:
+                    # Check if this might be a Gemini-specific error based on the current LLM configuration
+                    try:
+                        current_provider = config.llm._detect_provider() if config.llm else 'unknown'
+                        if current_provider == 'gemini':
+                            error_msg = handle_gemini_runtime_error(e, f"Episode processing for '{name}'")
+                        else:
+                            error_msg = str(e)
+                    except Exception:
+                        # Fallback to generic error message if provider detection fails
+                        error_msg = str(e)
+                
                 logger.error(
                     f"Error processing episode '{name}' for group_id {group_id_str}: {error_msg}"
                 )
@@ -821,7 +1395,17 @@ async def add_memory(
             message=f"Episode '{name}' queued for processing (position: {episode_queues[group_id_str].qsize()})"
         )
     except Exception as e:
-        error_msg = str(e)
+        # Enhanced error handling for configuration and setup errors
+        try:
+            current_provider = config.llm._detect_provider() if config.llm else 'unknown'
+            if current_provider == 'gemini':
+                error_msg = handle_gemini_runtime_error(e, 'Episode queuing')
+            else:
+                error_msg = str(e)
+        except Exception:
+            # Fallback to generic error message if provider detection fails
+            error_msg = str(e)
+        
         logger.error(f'Error queuing episode task: {error_msg}')
         return ErrorResponse(error=f'Error queuing episode task: {error_msg}')
 
@@ -902,7 +1486,26 @@ async def search_memory_nodes(
 
         return NodeSearchResponse(message='Nodes retrieved successfully', nodes=formatted_nodes)
     except Exception as e:
-        error_msg = str(e)
+        # Enhanced error handling with Gemini-specific error messages
+        if isinstance(e, (RateLimitError, RefusalError, EmptyResponseError)):
+            # Handle known LLM client errors
+            if isinstance(e, RateLimitError):
+                error_msg = handle_gemini_runtime_error(e, 'Node search')
+            elif isinstance(e, RefusalError):
+                error_msg = f"Node search was refused by the LLM: {e}"
+            else:  # EmptyResponseError
+                error_msg = f"Node search received empty response from LLM: {e}"
+        else:
+            # Check if this might be a Gemini-specific error
+            try:
+                current_provider = config.llm._detect_provider() if config.llm else 'unknown'
+                if current_provider == 'gemini':
+                    error_msg = handle_gemini_runtime_error(e, 'Node search')
+                else:
+                    error_msg = str(e)
+            except Exception:
+                error_msg = str(e)
+        
         logger.error(f'Error searching nodes: {error_msg}')
         return ErrorResponse(error=f'Error searching nodes: {error_msg}')
 
@@ -956,7 +1559,26 @@ async def search_memory_facts(
         facts = [format_fact_result(edge) for edge in relevant_edges]
         return FactSearchResponse(message='Facts retrieved successfully', facts=facts)
     except Exception as e:
-        error_msg = str(e)
+        # Enhanced error handling with Gemini-specific error messages
+        if isinstance(e, (RateLimitError, RefusalError, EmptyResponseError)):
+            # Handle known LLM client errors
+            if isinstance(e, RateLimitError):
+                error_msg = handle_gemini_runtime_error(e, 'Fact search')
+            elif isinstance(e, RefusalError):
+                error_msg = f"Fact search was refused by the LLM: {e}"
+            else:  # EmptyResponseError
+                error_msg = f"Fact search received empty response from LLM: {e}"
+        else:
+            # Check if this might be a Gemini-specific error
+            try:
+                current_provider = config.llm._detect_provider() if config.llm else 'unknown'
+                if current_provider == 'gemini':
+                    error_msg = handle_gemini_runtime_error(e, 'Fact search')
+                else:
+                    error_msg = str(e)
+            except Exception:
+                error_msg = str(e)
+        
         logger.error(f'Error searching facts: {error_msg}')
         return ErrorResponse(error=f'Error searching facts: {error_msg}')
 
@@ -1178,7 +1800,13 @@ async def initialize_server() -> MCPConfig:
         help='Transport to use for communication with the client. (default: sse)',
     )
     parser.add_argument(
-        '--model', help=f'Model name to use with the LLM client. (default: {DEFAULT_LLM_MODEL})'
+        '--model', 
+        help=f'Model name to use with the LLM client. '
+             f'Supports OpenAI models (gpt-4.1-mini, gpt-4o), '
+             f'Gemini models (gemini-2.5-flash, gemini-2.5-pro, gemini-1.5-flash), '
+             f'and Azure OpenAI models. Requires corresponding API key: '
+             f'OPENAI_API_KEY for OpenAI/gpt models, GOOGLE_API_KEY for Gemini models. '
+             f'(default: {DEFAULT_LLM_MODEL})'
     )
     parser.add_argument(
         '--small-model',

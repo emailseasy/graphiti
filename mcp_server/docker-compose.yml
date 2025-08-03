@@ -35,6 +35,9 @@ services:
       - NEO4J_USER=${NEO4J_USER:-neo4j}
       - NEO4J_PASSWORD=${NEO4J_PASSWORD:-demodemo}
       - OPENAI_API_KEY=${OPENAI_API_KEY}
+      # Google Gemini API configuration (uncomment to use Gemini models)
+      # - GOOGLE_API_KEY=${GOOGLE_API_KEY}
+      # - GEMINI_THINKING_ENABLED=${GEMINI_THINKING_ENABLED:-false}
       - MODEL_NAME=${MODEL_NAME}
       - PATH=/root/.local/bin:${PATH}
       - SEMAPHORE_LIMIT=${SEMAPHORE_LIMIT:-10}
